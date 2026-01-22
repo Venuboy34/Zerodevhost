@@ -66,7 +66,7 @@ def check_db_connection():
 @app.route('/')
 def home():
     return jsonify({
-        'message': 'File Hosting API',
+        'message': 'API is running',
         'status': 'online',
         'database': 'connected' if db else 'disconnected',
         'endpoints': {
