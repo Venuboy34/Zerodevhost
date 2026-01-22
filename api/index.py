@@ -1,8 +1,5 @@
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
-from pymongo import MongoClient
-from bson import ObjectId
-import gridfs
 import os
 import random
 import string
@@ -11,20 +8,36 @@ from datetime import datetime
 app = Flask(__name__)
 CORS(app)
 
-# MongoDB connection with error handling
-try:
-    MONGO_URI = os.environ.get('MONGO_URI', 'mongodb://localhost:27017/')
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    db = client['file_hosting']
-    fs = gridfs.GridFS(db)
-    files_collection = db['files']
-    # Test connection
-    client.server_info()
-except Exception as e:
-    print(f"MongoDB connection error: {e}")
-    db = None
-    fs = None
-    files_collection = None
+# Initialize MongoDB connection lazily
+_db = None
+_fs = None
+_files_collection = None
+
+def get_db():
+    """Lazy load MongoDB connection"""
+    global _db, _fs, _files_collection
+    
+    if _db is None:
+        try:
+            from pymongo import MongoClient
+            import gridfs
+            
+            MONGO_URI = os.environ.get('MONGO_URI')
+            if not MONGO_URI:
+                return None, None, None
+            
+            client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+            _db = client['file_hosting']
+            _fs = gridfs.GridFS(_db)
+            _files_collection = _db['files']
+            
+            # Test connection
+            client.server_info()
+        except Exception as e:
+            print(f"MongoDB Error: {e}")
+            return None, None, None
+    
+    return _db, _fs, _files_collection
 
 # File type extensions mapping
 EXTENSION_MAP = {
@@ -54,36 +67,50 @@ def get_extension(content_type):
     """Get file extension from content type"""
     return EXTENSION_MAP.get(content_type, '.bin')
 
-def check_db_connection():
-    """Check if database is connected"""
-    if not db or not fs or not files_collection:
-        return jsonify({
-            'error': 'Database connection failed',
-            'message': 'Please check your MONGO_URI environment variable'
-        }), 500
-    return None
-
 @app.route('/')
 def home():
+    db, fs, files_collection = get_db()
+    
     return jsonify({
         'message': 'API is running',
         'status': 'online',
         'database': 'connected' if db else 'disconnected',
-        'endpoints': {
-            'upload': 'POST /upload',
-            'view': 'GET /:code',
-            'delete': 'DELETE /delete/:file_id',
-            'list': 'GET /files',
-            'info': 'GET /info/:code'
-        }
+        'version': '1.0.0'
     })
+
+@app.route('/health')
+def health():
+    db, fs, files_collection = get_db()
+    
+    mongo_uri_set = bool(os.environ.get('MONGO_URI'))
+    
+    status = {
+        'status': 'healthy',
+        'timestamp': datetime.utcnow().isoformat(),
+        'mongo_uri_set': mongo_uri_set,
+        'database': 'connected' if db else 'disconnected'
+    }
+    
+    if not mongo_uri_set:
+        status['error'] = 'MONGO_URI environment variable not set'
+        return jsonify(status), 500
+    
+    if not db:
+        status['error'] = 'Database connection failed'
+        return jsonify(status), 500
+    
+    return jsonify(status)
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
     """Upload a file and return unique URL"""
-    db_check = check_db_connection()
-    if db_check:
-        return db_check
+    db, fs, files_collection = get_db()
+    
+    if not db:
+        return jsonify({
+            'error': 'Database not connected',
+            'message': 'Please set MONGO_URI environment variable'
+        }), 500
     
     try:
         if 'file' not in request.files:
@@ -100,8 +127,10 @@ def upload_file():
         
         # Generate unique code
         code = generate_random_code(4)
-        while files_collection.find_one({'code': code}):
+        attempts = 0
+        while files_collection.find_one({'code': code}) and attempts < 10:
             code = generate_random_code(4)
+            attempts += 1
         
         # Store file in GridFS
         file_data = file.read()
@@ -148,11 +177,18 @@ def upload_file():
 @app.route('/<path:filename>')
 def view_file(filename):
     """View/download file by code and extension"""
-    db_check = check_db_connection()
-    if db_check:
-        return db_check
+    # Skip special routes
+    if filename in ['upload', 'health', 'files']:
+        return jsonify({'error': 'Invalid route'}), 404
+    
+    db, fs, files_collection = get_db()
+    
+    if not db:
+        return jsonify({'error': 'Database not connected'}), 500
     
     try:
+        from bson import ObjectId
+        
         # Extract code and extension
         parts = filename.rsplit('.', 1)
         if len(parts) == 2:
@@ -194,11 +230,14 @@ def view_file(filename):
 @app.route('/delete/<file_id>', methods=['DELETE', 'POST'])
 def delete_file(file_id):
     """Delete a file by its ID"""
-    db_check = check_db_connection()
-    if db_check:
-        return db_check
+    db, fs, files_collection = get_db()
+    
+    if not db:
+        return jsonify({'error': 'Database not connected'}), 500
     
     try:
+        from bson import ObjectId
+        
         file_doc = files_collection.find_one({'_id': ObjectId(file_id)})
         
         if not file_doc:
@@ -224,9 +263,10 @@ def delete_file(file_id):
 @app.route('/files', methods=['GET'])
 def list_files():
     """List all uploaded files"""
-    db_check = check_db_connection()
-    if db_check:
-        return db_check
+    db, fs, files_collection = get_db()
+    
+    if not db:
+        return jsonify({'error': 'Database not connected'}), 500
     
     try:
         files = []
@@ -258,9 +298,10 @@ def list_files():
 @app.route('/info/<code>', methods=['GET'])
 def file_info(code):
     """Get file information by code"""
-    db_check = check_db_connection()
-    if db_check:
-        return db_check
+    db, fs, files_collection = get_db()
+    
+    if not db:
+        return jsonify({'error': 'Database not connected'}), 500
     
     try:
         file_doc = files_collection.find_one({'code': code})
@@ -286,23 +327,3 @@ def file_info(code):
             'error': 'Error getting file info',
             'message': str(e)
         }), 500
-
-# Health check endpoint
-@app.route('/health')
-def health():
-    db_status = 'connected'
-    try:
-        if db:
-            client.server_info()
-    except:
-        db_status = 'disconnected'
-    
-    return jsonify({
-        'status': 'healthy',
-        'database': db_status,
-        'timestamp': datetime.utcnow().isoformat()
-    })
-
-# For local development
-if __name__ == '__main__':
-    app.run(debug=True)
