@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from pymongo import MongoClient
 from bson import ObjectId
@@ -7,17 +7,24 @@ import os
 import random
 import string
 from datetime import datetime
-import io
 
 app = Flask(__name__)
 CORS(app)
 
-# MongoDB connection
-MONGO_URI = os.environ.get('MONGO_URI', 'mongodb://localhost:27017/')
-client = MongoClient(MONGO_URI)
-db = client['file_hosting']
-fs = gridfs.GridFS(db)
-files_collection = db['files']
+# MongoDB connection with error handling
+try:
+    MONGO_URI = os.environ.get('MONGO_URI', 'mongodb://localhost:27017/')
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    db = client['file_hosting']
+    fs = gridfs.GridFS(db)
+    files_collection = db['files']
+    # Test connection
+    client.server_info()
+except Exception as e:
+    print(f"MongoDB connection error: {e}")
+    db = None
+    fs = None
+    files_collection = None
 
 # File type extensions mapping
 EXTENSION_MAP = {
@@ -47,98 +54,125 @@ def get_extension(content_type):
     """Get file extension from content type"""
     return EXTENSION_MAP.get(content_type, '.bin')
 
+def check_db_connection():
+    """Check if database is connected"""
+    if not db or not fs or not files_collection:
+        return jsonify({
+            'error': 'Database connection failed',
+            'message': 'Please check your MONGO_URI environment variable'
+        }), 500
+    return None
+
 @app.route('/')
 def home():
     return jsonify({
         'message': 'File Hosting API',
+        'status': 'online',
+        'database': 'connected' if db else 'disconnected',
         'endpoints': {
             'upload': 'POST /upload',
             'view': 'GET /:code',
             'delete': 'DELETE /delete/:file_id',
-            'list': 'GET /files'
+            'list': 'GET /files',
+            'info': 'GET /info/:code'
         }
     })
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
     """Upload a file and return unique URL"""
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file provided'}), 400
+    db_check = check_db_connection()
+    if db_check:
+        return db_check
     
-    file = request.files['file']
-    
-    if file.filename == '':
-        return jsonify({'error': 'No file selected'}), 400
-    
-    # Get file metadata
-    content_type = file.content_type or 'application/octet-stream'
-    extension = get_extension(content_type)
-    
-    # Generate unique code
-    code = generate_random_code(4)
-    while files_collection.find_one({'code': code}):
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        # Get file metadata
+        content_type = file.content_type or 'application/octet-stream'
+        extension = get_extension(content_type)
+        
+        # Generate unique code
         code = generate_random_code(4)
+        while files_collection.find_one({'code': code}):
+            code = generate_random_code(4)
+        
+        # Store file in GridFS
+        file_data = file.read()
+        file_id = fs.put(
+            file_data,
+            filename=file.filename,
+            content_type=content_type
+        )
+        
+        # Store metadata
+        file_doc = {
+            'code': code,
+            'extension': extension,
+            'original_name': file.filename,
+            'content_type': content_type,
+            'file_id': file_id,
+            'size': len(file_data),
+            'uploaded_at': datetime.utcnow()
+        }
+        
+        result = files_collection.insert_one(file_doc)
+        
+        # Generate URLs
+        base_url = request.host_url.rstrip('/')
+        file_url = f"{base_url}/{code}{extension}"
+        
+        return jsonify({
+            'success': True,
+            'file_id': str(result.inserted_id),
+            'code': code,
+            'url': file_url,
+            'direct_link': file_url,
+            'delete_url': f"{base_url}/delete/{str(result.inserted_id)}",
+            'size': len(file_data),
+            'type': content_type
+        }), 201
     
-    # Store file in GridFS
-    file_data = file.read()
-    file_id = fs.put(
-        file_data,
-        filename=file.filename,
-        content_type=content_type
-    )
-    
-    # Store metadata
-    file_doc = {
-        'code': code,
-        'extension': extension,
-        'original_name': file.filename,
-        'content_type': content_type,
-        'file_id': file_id,
-        'size': len(file_data),
-        'uploaded_at': datetime.utcnow()
-    }
-    
-    result = files_collection.insert_one(file_doc)
-    
-    # Generate URLs
-    base_url = request.host_url.rstrip('/')
-    file_url = f"{base_url}/{code}{extension}"
-    
-    return jsonify({
-        'success': True,
-        'file_id': str(result.inserted_id),
-        'code': code,
-        'url': file_url,
-        'direct_link': file_url,
-        'delete_url': f"{base_url}/delete/{str(result.inserted_id)}",
-        'size': len(file_data),
-        'type': content_type
-    }), 201
+    except Exception as e:
+        return jsonify({
+            'error': 'Upload failed',
+            'message': str(e)
+        }), 500
 
 @app.route('/<path:filename>')
 def view_file(filename):
     """View/download file by code and extension"""
-    # Extract code and extension
-    parts = filename.rsplit('.', 1)
-    if len(parts) == 2:
-        code, ext = parts
-        ext = '.' + ext
-    else:
-        code = filename
-        ext = None
+    db_check = check_db_connection()
+    if db_check:
+        return db_check
     
-    # Find file metadata
-    query = {'code': code}
-    if ext:
-        query['extension'] = ext
-    
-    file_doc = files_collection.find_one(query)
-    
-    if not file_doc:
-        return jsonify({'error': 'File not found'}), 404
-    
-    # Retrieve file from GridFS
     try:
+        # Extract code and extension
+        parts = filename.rsplit('.', 1)
+        if len(parts) == 2:
+            code, ext = parts
+            ext = '.' + ext
+        else:
+            code = filename
+            ext = None
+        
+        # Find file metadata
+        query = {'code': code}
+        if ext:
+            query['extension'] = ext
+        
+        file_doc = files_collection.find_one(query)
+        
+        if not file_doc:
+            return jsonify({'error': 'File not found'}), 404
+        
+        # Retrieve file from GridFS
         grid_file = fs.get(file_doc['file_id'])
         file_data = grid_file.read()
         
@@ -146,15 +180,24 @@ def view_file(filename):
             file_data,
             mimetype=file_doc['content_type'],
             headers={
-                'Content-Disposition': f'inline; filename="{file_doc["original_name"]}"'
+                'Content-Disposition': f'inline; filename="{file_doc["original_name"]}"',
+                'Cache-Control': 'public, max-age=31536000'
             }
         )
+    
     except Exception as e:
-        return jsonify({'error': 'Error retrieving file', 'details': str(e)}), 500
+        return jsonify({
+            'error': 'Error retrieving file',
+            'message': str(e)
+        }), 500
 
-@app.route('/delete/<file_id>', methods=['DELETE'])
+@app.route('/delete/<file_id>', methods=['DELETE', 'POST'])
 def delete_file(file_id):
     """Delete a file by its ID"""
+    db_check = check_db_connection()
+    if db_check:
+        return db_check
+    
     try:
         file_doc = files_collection.find_one({'_id': ObjectId(file_id)})
         
@@ -173,53 +216,93 @@ def delete_file(file_id):
         }), 200
         
     except Exception as e:
-        return jsonify({'error': 'Error deleting file', 'details': str(e)}), 500
+        return jsonify({
+            'error': 'Error deleting file',
+            'message': str(e)
+        }), 500
 
 @app.route('/files', methods=['GET'])
 def list_files():
     """List all uploaded files"""
-    files = []
-    for doc in files_collection.find().sort('uploaded_at', -1):
-        base_url = request.host_url.rstrip('/')
-        files.append({
-            'file_id': str(doc['_id']),
-            'code': doc['code'],
-            'original_name': doc['original_name'],
-            'url': f"{base_url}/{doc['code']}{doc['extension']}",
-            'size': doc['size'],
-            'type': doc['content_type'],
-            'uploaded_at': doc['uploaded_at'].isoformat(),
-            'delete_url': f"{base_url}/delete/{str(doc['_id'])}"
+    db_check = check_db_connection()
+    if db_check:
+        return db_check
+    
+    try:
+        files = []
+        for doc in files_collection.find().sort('uploaded_at', -1).limit(100):
+            base_url = request.host_url.rstrip('/')
+            files.append({
+                'file_id': str(doc['_id']),
+                'code': doc['code'],
+                'original_name': doc['original_name'],
+                'url': f"{base_url}/{doc['code']}{doc['extension']}",
+                'size': doc['size'],
+                'type': doc['content_type'],
+                'uploaded_at': doc['uploaded_at'].isoformat(),
+                'delete_url': f"{base_url}/delete/{str(doc['_id'])}"
+            })
+        
+        return jsonify({
+            'success': True,
+            'count': len(files),
+            'files': files
         })
     
-    return jsonify({
-        'success': True,
-        'count': len(files),
-        'files': files
-    })
+    except Exception as e:
+        return jsonify({
+            'error': 'Error listing files',
+            'message': str(e)
+        }), 500
 
 @app.route('/info/<code>', methods=['GET'])
 def file_info(code):
     """Get file information by code"""
-    file_doc = files_collection.find_one({'code': code})
+    db_check = check_db_connection()
+    if db_check:
+        return db_check
     
-    if not file_doc:
-        return jsonify({'error': 'File not found'}), 404
+    try:
+        file_doc = files_collection.find_one({'code': code})
+        
+        if not file_doc:
+            return jsonify({'error': 'File not found'}), 404
+        
+        base_url = request.host_url.rstrip('/')
+        
+        return jsonify({
+            'success': True,
+            'file_id': str(file_doc['_id']),
+            'code': file_doc['code'],
+            'original_name': file_doc['original_name'],
+            'url': f"{base_url}/{file_doc['code']}{file_doc['extension']}",
+            'size': file_doc['size'],
+            'type': file_doc['content_type'],
+            'uploaded_at': file_doc['uploaded_at'].isoformat()
+        })
     
-    base_url = request.host_url.rstrip('/')
+    except Exception as e:
+        return jsonify({
+            'error': 'Error getting file info',
+            'message': str(e)
+        }), 500
+
+# Health check endpoint
+@app.route('/health')
+def health():
+    db_status = 'connected'
+    try:
+        if db:
+            client.server_info()
+    except:
+        db_status = 'disconnected'
     
     return jsonify({
-        'success': True,
-        'file_id': str(file_doc['_id']),
-        'code': file_doc['code'],
-        'original_name': file_doc['original_name'],
-        'url': f"{base_url}/{file_doc['code']}{file_doc['extension']}",
-        'size': file_doc['size'],
-        'type': file_doc['content_type'],
-        'uploaded_at': file_doc['uploaded_at'].isoformat()
+        'status': 'healthy',
+        'database': db_status,
+        'timestamp': datetime.utcnow().isoformat()
     })
 
-# Vercel serverless function handler
-def handler(request):
-    with app.request_context(request.environ):
-        return app.full_dispatch_request()
+# For local development
+if __name__ == '__main__':
+    app.run(debug=True)
